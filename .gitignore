@@ -1,3 +1,9 @@
+# vim swap
+*.swp 
+
+# Personal access tokens
+*.pat
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
