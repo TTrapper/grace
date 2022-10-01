@@ -34,8 +34,6 @@ def scaled_dot_product_attention(q, k, v, mask):
   # scale matmul_qk
   dk = tf.cast(tf.shape(k)[-1], tf.float32)
   scaled_attention_logits = matmul_qk / tf.math.sqrt(dk)
-#  scaled_attention_logits = matmul_qk / 0.25
-
 
   # add the mask to the scaled tensor.
   if mask is not None:
@@ -122,32 +120,27 @@ class Model(tf.keras.Model):
         self.num_heads = 8
         self.seqlen = seqlen
         self.d_model = d_model
-        self.char_out_embed_size = 64
 
         backbone, inputs = self.make_backbone(d_model, dropout)
         self.generator = self.make_generator(backbone, inputs)
         self.descriminator = self.make_descriminator(backbone, inputs)
         untrainable_backbone, untrainable_inputs = self.make_backbone(d_model, dropout)
-        self.untrainable_descriminator = self.make_descriminator(untrainable_backbone, untrainable_inputs)
+        self.untrainable_descriminator = self.make_descriminator(
+                untrainable_backbone,
+                untrainable_inputs
+        )
         self.untrainable_descriminator.trainable = False
 
-        self.maxvar = tf.math.reduce_variance(tf.one_hot(0, depth=256))
-        self.last_predict = None
-        self.last_gen_loss = 0.69
-        self.cur_gen_loss = 0.69
-        self.use_gen_ratio = 1/4
-        self.noise = gen_noise
-        self.xe_loss = tf.keras.losses.CategoricalCrossentropy(from_logits=True, reduction=tf.keras.losses.Reduction.NONE)
-        self.cosine_loss = tf.keras.losses.CosineSimilarity(reduction=tf.keras.losses.Reduction.NONE)
-        self.sig_loss = tf.keras.losses.BinaryCrossentropy(from_logits=True, reduction=tf.keras.losses.Reduction.NONE)
-        self.mse = tf.keras.losses.MeanSquaredError(reduction=tf.keras.losses.Reduction.NONE)
+        self.xe_loss = tf.keras.losses.CategoricalCrossentropy(
+                from_logits=True, 
+                reduction=tf.keras.losses.Reduction.NONE
+        )
 
     def make_backbone(self, d_model, dropout):
         nheads = self.num_heads
 
         condition_inputs = tf.keras.Input(shape=(None, 256)) # one-hot bytes
         inputs = tf.keras.Input(shape=(None, 256)) # one-hot bytes
-        mask_ahead = tf.keras.Input(shape=()) # flag 1 if should use look ahead mask else 0
         condlen = tf.shape(condition_inputs)[1]
         seqlen = tf.shape(inputs)[1]
         pos = tf.one_hot(tf.range(condlen + seqlen), depth=128)[tf.newaxis, :, :]
@@ -160,13 +153,8 @@ class Model(tf.keras.Model):
         q = x[:, condlen:]
         condition = x[:, :condlen]
 
-
-        look_ahead_mask = 0 * mask_ahead * create_look_ahead_mask(seqlen)
-        condition_not_masked = tf.zeros((seqlen, condlen))
         for i in range(8):
-            mask = tf.concat([condition_not_masked, look_ahead_mask], axis=1) if i % 8 == 0 else look_ahead_mask
-            mask = mask[tf.newaxis, tf.newaxis, :, :]
-            attn_out, attn_weights = MultiHeadAttention(d_model, nheads)(x,x,q, mask)
+            attn_out, attn_weights = MultiHeadAttention(d_model, nheads)(x,x,q, None)
             attention_weights.append(attn_weights)
             attn_out = tf.keras.layers.LayerNormalization(epsilon=1e-6)(attn_out + q)
             attn_out = tf.keras.layers.Dropout(rate=dropout)(attn_out)
@@ -184,7 +172,7 @@ class Model(tf.keras.Model):
                 x = tf.concat([condition, q], axis=1)
                 outs.append(q)
         x = tf.concat(outs, axis=-1)
-        return tf.keras.Model(inputs=(condition_inputs, inputs, mask_ahead), outputs=(x, attention_weights)), (condition_inputs, inputs, mask_ahead)
+        return tf.keras.Model(inputs=(condition_inputs, inputs), outputs=(x, attention_weights)), (condition_inputs, inputs)
 
     def make_generator(self, backbone, inputs):
         gen_logits = tf.keras.layers.Dense(256)(backbone.outputs[0])
@@ -210,12 +198,12 @@ class Model(tf.keras.Model):
         batchsize = tf.shape(masked_inputs)[0]
         seqlen = tf.shape(masked_inputs)[1]
 
-        gen_logits, attn_weights = self.generator((condition_inputs, masked_inputs, 0))
+        gen_logits, attn_weights = self.generator((condition_inputs, masked_inputs))
         generated = tf.nn.softmax(gen_logits / 1)
         real = hot_clean
         fake = tf.nn.softmax(gen_logits / 1)
 
-        label_smoothing = 0.5#16/256
+        label_smoothing = 0.5
         step = 0.1
         t = tf.ones([batchsize, seqlen, 1], dtype=tf.float32)
         prev_direction = None
@@ -248,27 +236,8 @@ class Model(tf.keras.Model):
         real = tf.where(corrupt_mask == 1.0, fake, real)
         real = tf.stop_gradient(real)
 
-
-#        self.untrainable_descriminator.set_weights(self.descriminator.get_weights())
-        is_real_fake, lm_logits_fake, d_attn_weights = self.untrainable_descriminator((condition_inputs, fake, 1))
-        is_real_false = is_real_fake
-        is_real_fake_corrupt = is_real_fake # FIXME
-        is_real_true, lm_logits, _ = self.descriminator((condition_inputs, tf.stop_gradient(real), 1))
-
-
-        is_real_fake_loss = self.sig_loss(tf.ones_like(corrupt_mask), is_real_fake)
-        correct_mask = self.confidently_correct(real, generated, min_confidence=0.0)
-        correct_mask = tf.where((correct_mask[:, :, tf.newaxis] == 1) | (corrupt_mask == 1), 1, 0) # could just use correct directly?
-        is_real_fake_corrupt_loss = self.sig_loss(correct_mask, is_real_fake_corrupt)
-        correct_mask = self.confidently_correct(real, hot_clean, min_confidence=0.0)
-        is_real_true_loss = self.sig_loss(correct_mask, is_real_true)
-
-        is_fake = 1 - tf.nn.sigmoid(is_real_fake)[:, :, 0]
-        is_real = 1 - is_fake
-
-        lm_fake_loss = self.xe_loss(hot_clean, lm_logits_fake)
-        correct_mask = self.confidently_correct(generated, hot_clean, min_confidence=0.0)
-        lm_fake_loss *= tf.where(correct_mask == 1, 1.0, -1.0)
+        _, lm_logits_fake, d_attn_weights = self.untrainable_descriminator((condition_inputs, fake))
+        _, lm_logits, _ = self.descriminator((condition_inputs, tf.stop_gradient(real)))
 
         lm_fake_loss = self.xe_loss(tf.one_hot(tf.argmax(lm_logits_fake, axis=-1), depth=256), gen_logits, (1 - not_masked))
         gen_loss = self.xe_loss(hot_clean, gen_logits, not_masked)
@@ -276,9 +245,6 @@ class Model(tf.keras.Model):
         return ((
                  lm_logits,
                  lm_fake_loss,
-                 is_real_fake_corrupt_loss,
-                 is_real_fake_loss,
-                 is_real_true_loss,
                  gen_loss,
                  norm_loss),
                 {'logits':gen_logits,
@@ -287,9 +253,6 @@ class Model(tf.keras.Model):
                  'real':real,
                  'fake':fake,
                  'noised':tf.nn.softmax(lm_logits_fake),
-                 'is_real_fake': is_real_fake,
-                 'is_real_false': is_real_false,
-                 'is_real_true': is_real_true,
                  'attn_weights': attn_weights,
                  'd_attn_weights': d_attn_weights
                  })
@@ -349,13 +312,9 @@ def make_dataset(model, fpath, batchsize, seqlen, condlen, gramlen, shuffle, tra
             masked_in = center
             masked_in, corrupt_mask = corrupt_data(masked_in, np.random.uniform(0.5, 1))
 
-            is_real_fake  = seqlen * [1]
-            is_real_false = seqlen * [0]
-            is_real_true  = seqlen * [1]
-
             hot_clean = tf.one_hot(center, depth=256)
             yield ((masked_in, condition, hot_clean, corrupt_mask),
-                    (center, center, center, is_real_fake, is_real_true, center, center))
+                    (center, center, center, center))
     dataset = tf.data.Dataset.from_generator(
             gen,
             output_signature = (
@@ -370,9 +329,6 @@ def make_dataset(model, fpath, batchsize, seqlen, condlen, gramlen, shuffle, tra
                     tf.TensorSpec(shape=(seqlen), dtype=tf.int32),
                     tf.TensorSpec(shape=(seqlen), dtype=tf.int32),
                     tf.TensorSpec(shape=(seqlen), dtype=tf.int32),
-                    tf.TensorSpec(shape=(seqlen), dtype=tf.int32),
-                    tf.TensorSpec(shape=(seqlen), dtype=tf.int32),
-                    tf.TensorSpec(shape=(seqlen), dtype=tf.int32),
                 ),
 
             )
@@ -382,7 +338,7 @@ def make_dataset(model, fpath, batchsize, seqlen, condlen, gramlen, shuffle, tra
 
 
 
-def plots(generated, fake, real, logits, gen_logits, noised, idx, name):
+def plots(generated, fake, real, logits, gen_logits, idx, name):
     xaxis = dict(
         tickmode = 'array',
         tickvals = list(range(256)),
@@ -408,38 +364,24 @@ def plots(generated, fake, real, logits, gen_logits, noised, idx, name):
     fig.update_layout(xaxis=xaxis)
     fig.write_html(f'x_fake_{name}.html')
 
-    fig = px.imshow(noised[idx], aspect='auto')
-    fig.update_layout(xaxis=xaxis)
-    fig.write_html(f'x_noised_{name}.html')
-
 def char_predict(model, dataset, num):
     inputs, targets = next(iter(dataset)) # NOTE this always grabs the 1st batch because its a new iterator each time
     cnd_str = to_str(inputs[1])
     target_strings = to_str(targets[0])
-    is_real_fake = targets[-3]
-    is_real_false = targets[-2]
-    is_real_true = targets[-1]
     out = model.forward_pass(inputs, training=False)
 
     zero_ins = [i[:1] for i in inputs]
+    zero_condition = zero_ins[1]
     zero_ins[0] = tf.zeros_like(zero_ins[0])
     full_gen_out = model.forward_pass(zero_ins , training=False)
     full_gen_score = tf.nn.sigmoid(full_gen_out[0][-3]).numpy()
     full_gen_out = full_gen_out[1]['generated']
-
-    fake_decision = tf.nn.sigmoid(out[1]['is_real_fake'][:, :, 0]).numpy()
-    false_decision = tf.nn.sigmoid(out[1]['is_real_false'][:, :, 0]).numpy()
-    true_decision = tf.nn.sigmoid(out[1]['is_real_true'][:, :, 0]).numpy()
-    right_masklen = 32 # FIXME should come from the data
-    sort_idx = np.argsort(np.sum(fake_decision[:, -right_masklen:] , axis=1))
-    median_idx = sort_idx[len(sort_idx) // 2]
 
     generated = out[1]['generated']
     fake = out[1]['fake']
     real = out[1]['real']
     logits = out[1]['logits']
     gen_logits = out[1]['gen_logits']
-    noised = out[1]['noised']
     attn_weights = out[1]['attn_weights']
     for idx, aw in enumerate(attn_weights):
         aw = aw[0] # 1st batch element
@@ -453,31 +395,27 @@ def char_predict(model, dataset, num):
         fig = px.imshow(aw, aspect='auto')
         fig.write_html(f'x_d_attn_{idx}.html')
 
-    plots(generated, fake, real, logits, gen_logits, noised, sort_idx[0], 'worst')
-    plots(generated, fake, real, logits, gen_logits, noised, sort_idx[-1], 'best')
+    plots(generated, fake, real, logits, gen_logits, 0, 'worst')
+    plots(generated, fake, real, logits, gen_logits, 1, 'best')
 
-
-    print('--\n')
-    print(to_str(tf.argmax(full_gen_out, axis=-1))[0])
-    print()
-    predicted = to_str(tf.argmax(logits, axis=-1))
-
+    full_gen_out = tf.argmax(full_gen_out, axis=-1)
     generated = tf.argmax(generated, axis=-1)
     logits = tf.argmax(logits, axis=-1)
     real = tf.argmax(real, axis=-1)
     fake = tf.argmax(fake, axis=-1)
 
-
+    zero_condition = to_str(zero_condition)
+    full_gen_out = to_str(full_gen_out)
     generated = to_str(generated)
     lm_str = to_str(logits)
     masked_str = to_str(inputs[0])
     real_str = to_str(real)
     fake_str = to_str(fake)
 
-    middle = len(sort_idx) // 2
-#    for i in np.concatenate([sort_idx[:1], sort_idx[middle-num:middle+num], sort_idx[-1:]], axis=0):
-    for i in range(num+2):
-        print((np.mean(fake_decision[i][-right_masklen:])))
+    print('--\n')
+    print(zero_condition[0] + '|' + full_gen_out[0])
+    print('\n------\n')
+    for i in range(num):
         print(cnd_str[i] + '|' + generated[i])
         print('--')
         print(cnd_str[i] + '|' + target_strings[i])
@@ -503,9 +441,9 @@ if __name__ == '__main__':
     d_model = 256
     enc_depth = 8
     dropout = 0.01
-    batchsize = 2048
-    condlen = 16
-    seqlen = 8
+    batchsize = 512
+    condlen = 32
+    seqlen = 32
     gramlen = 5
     gen_noise = 0.0
     gen_noise_decay = 0.9
@@ -536,8 +474,8 @@ if __name__ == '__main__':
     norm_loss = NormLoss()
     through_loss = PassthroughLoss()
 
-    loss = (cat_loss, through_loss , through_loss, through_loss, through_loss, through_loss, through_loss)
-    model.compile(optimizer=optimizer, loss=loss, loss_weights=[1,1, 0, 0,0,1,1], metrics=[])
+    loss = (cat_loss, through_loss , through_loss, through_loss)
+    model.compile(optimizer=optimizer, loss=loss, loss_weights=[1,1,1,1], metrics=[])
 
 
     logits = model(inputs) # Running the model builds all the layers
@@ -547,14 +485,14 @@ if __name__ == '__main__':
         for w in model.weights:
             if 'descrim' in w.name:
                 dweights[w.name] = w.read_value()
-        model.load_weights('./unregressive')
+        model.load_weights('./saves/checkpoint')
         model.untrainable_descriminator.set_weights(model.descriminator.get_weights())
 
-    char_predict(model, dataset, 8)
+    char_predict(model, dataset, 16)
 
     if args.train:
         def save(epoch, logs):
-            model.save_weights('./unregressive', overwrite=True, save_format=None, options=None)
+            model.save_weights('./saves/checkpoint', overwrite=True, save_format=None, options=None)
             return
         save_callback = tf.keras.callbacks.LambdaCallback( on_epoch_end=save)
 
@@ -565,9 +503,9 @@ if __name__ == '__main__':
         copy_callback = tf.keras.callbacks.LambdaCallback(on_batch_end=copy_weights)
         def run_char_predict(batch, logs):
             if batch % 500 == 0:
-                char_predict(model, inference_dataset, 2)
+                char_predict(model, inference_dataset, 4)
             if batch % 500 == 499:
-                model.save_weights('./unregressive.batch', overwrite=True, save_format=None, options=None)
+                model.save_weights('./saves/checkpoint', overwrite=True, save_format=None, options=None)
 
         char_callback = tf.keras.callbacks.LambdaCallback(on_batch_end=run_char_predict)
 
