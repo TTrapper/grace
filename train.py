@@ -120,6 +120,7 @@ class Model(tf.keras.Model):
         self.num_heads = 8
         self.seqlen = seqlen
         self.d_model = d_model
+        self.maskidx = 0
 
         backbone, inputs = self.make_backbone(d_model, dropout)
         self.generator = self.make_generator(backbone, inputs)
@@ -132,7 +133,7 @@ class Model(tf.keras.Model):
         self.untrainable_descriminator.trainable = False
 
         self.xe_loss = tf.keras.losses.CategoricalCrossentropy(
-                from_logits=True, 
+                from_logits=True,
                 reduction=tf.keras.losses.Reduction.NONE
         )
 
@@ -189,70 +190,40 @@ class Model(tf.keras.Model):
         return tf.cast(correct & confident, x.dtype)
 
     def forward_pass(self, inputs, training):
-        not_masked = tf.where(inputs[0] == 0, 0.0, 1.0)
-        masked_inputs = tf.one_hot(inputs[0], depth=256)
-        condition_inputs = tf.one_hot(inputs[1], depth=256)
-        hot_clean = inputs[2]
-        real_corrupt_mask = inputs[3]
+        gen_masked = inputs[0]
+        denoise_masked = inputs[1]
+        condition = tf.one_hot(inputs[2], depth=256)
+        clean = inputs[3]
+        hot_clean = tf.one_hot(clean, depth=256)
 
-        batchsize = tf.shape(masked_inputs)[0]
-        seqlen = tf.shape(masked_inputs)[1]
+        batchsize = tf.shape(gen_masked)[0]
+        seqlen = tf.shape(gen_masked)[1]
 
-        gen_logits, attn_weights = self.generator((condition_inputs, masked_inputs))
-        generated = tf.nn.softmax(gen_logits / 1)
-        real = hot_clean
-        fake = tf.nn.softmax(gen_logits / 1)
+        gen_logits, attn_weights = self.generator((condition, tf.one_hot(gen_masked, depth=256)))
 
-        label_smoothing = 0.5
-        step = 0.1
-        t = tf.ones([batchsize, seqlen, 1], dtype=tf.float32)
-        prev_direction = None
-        for _ in range(100):
-            fake = tf.nn.softmax(gen_logits / t)
-            maxval = tf.reduce_max(fake, axis=-1, keepdims=True)
+        predicted = tf.one_hot(tf.argmax(gen_logits, axis=-1), depth=256)
+        fake = tf.stop_gradient(predicted)
+        real = tf.stop_gradient(tf.where(denoise_masked[:, :, tf.newaxis] == 0, fake, hot_clean))
 
-            direction = tf.where(maxval > label_smoothing, 1, -1)
-            if prev_direction is not None:
-                overshoot = tf.where(direction != prev_direction, 1, 0)
-                step = tf.where(overshoot == 1, step / 2, step)
-            prev_direction = direction
+        _, lm_logits_fake, d_attn_weights = self.untrainable_descriminator((condition, fake))
+        _, lm_logits, _ = self.descriminator((condition, real))
 
-            t = tf.where(maxval > label_smoothing, t + step, t - step)
-            t = tf.where(t <= 0.0, 1e-16, t)
+        denoised_gen = tf.one_hot(tf.argmax(lm_logits_fake, axis=-1), depth=256) # TODO better to model the softmax output?
 
-        predicted = tf.argmax(generated, axis=-1)
-        hot_predicted = tf.one_hot(predicted, depth=256)
-        max_value = tf.reduce_max(fake, axis=-1, keepdims=True)
-        hot_clean = tf.cast(hot_clean, fake.dtype)
-        value_at_correct_place = tf.reduce_sum(hot_clean * fake, axis=-1, keepdims=True)
-        real = tf.where(hot_clean == 1, max_value, fake)
-        real = tf.where(hot_predicted == 1, value_at_correct_place, real)
-
-
-        # TODO move this to dataset pipeline and pass in a 1/0 mask
-        corrupt_rate = tf.random.uniform((batchsize, 1, 1), minval=0.0, maxval=0.5)
-        corrupt_mask = tf.random.uniform(tf.shape(inputs[0][:, :, tf.newaxis]), maxval=1)
-        corrupt_mask = tf.where(corrupt_mask < corrupt_rate, 1.0, 0.0)
-        real = tf.where(corrupt_mask == 1.0, fake, real)
-        real = tf.stop_gradient(real)
-
-        _, lm_logits_fake, d_attn_weights = self.untrainable_descriminator((condition_inputs, fake))
-        _, lm_logits, _ = self.descriminator((condition_inputs, tf.stop_gradient(real)))
-
-        lm_fake_loss = self.xe_loss(tf.one_hot(tf.argmax(lm_logits_fake, axis=-1), depth=256), gen_logits, (1 - not_masked))
-        gen_loss = self.xe_loss(hot_clean, gen_logits, not_masked)
-        norm_loss = tf.nn.relu((tf.norm(gen_logits, axis=-1) - 20))
-        return ((
-                 lm_logits,
+        is_masked = tf.where(gen_masked == self.maskidx, 1, 0)
+        not_masked = 1 - is_masked
+        lm_fake_loss = self.xe_loss(denoised_gen, gen_logits)
+        gen_loss = self.xe_loss(hot_clean, gen_logits, not_masked) * 0 # TODO is this needed when starting from scratch?
+        norm_loss = tf.nn.relu((tf.norm(gen_logits, axis=-1) - 20)) # TODO is this needed at all now?
+        return ((lm_logits,
                  lm_fake_loss,
                  gen_loss,
                  norm_loss),
                 {'logits':gen_logits,
                  'gen_logits': gen_logits,
-                 'generated':generated,
+                 'generated':tf.nn.softmax(gen_logits, axis=-1),
                  'real':real,
                  'fake':fake,
-                 'noised':tf.nn.softmax(lm_logits_fake),
                  'attn_weights': attn_weights,
                  'd_attn_weights': d_attn_weights
                  })
@@ -309,20 +280,24 @@ def make_dataset(model, fpath, batchsize, seqlen, condlen, gramlen, shuffle, tra
             condition_tgt = text[1 + (start - condlen): 1 + start]
             center = text[start : start + seqlen]
 
-            masked_in = center
-            masked_in, corrupt_mask = corrupt_data(masked_in, np.random.uniform(0.5, 1))
+            sample = np.random.uniform(size=(seqlen))
+            mask_rate = np.random.uniform(0.5, 1)
+            gen_masked = np.where(sample < mask_rate, 0, center)
 
-            hot_clean = tf.one_hot(center, depth=256)
-            yield ((masked_in, condition, hot_clean, corrupt_mask),
+
+            mask_rate = np.random.uniform(0.0, 0.5)
+            denoise_masked = np.where(sample <  mask_rate, 0, center)
+
+            yield ((gen_masked, denoise_masked, condition, center),
                     (center, center, center, center))
     dataset = tf.data.Dataset.from_generator(
             gen,
             output_signature = (
                 (
                     tf.TensorSpec(shape=(seqlen), dtype=tf.int32),
+                    tf.TensorSpec(shape=(seqlen), dtype=tf.int32),
                     tf.TensorSpec(shape=(condlen), dtype=tf.int32),
-                    tf.TensorSpec(shape=(seqlen, 256), dtype=tf.int32),
-                    tf.TensorSpec(shape=(seqlen), dtype=tf.float32),
+                    tf.TensorSpec(shape=(seqlen), dtype=tf.int32),
                 ),
                 (
                     tf.TensorSpec(shape=(seqlen), dtype=tf.int32),
@@ -366,12 +341,12 @@ def plots(generated, fake, real, logits, gen_logits, idx, name):
 
 def char_predict(model, dataset, num):
     inputs, targets = next(iter(dataset)) # NOTE this always grabs the 1st batch because its a new iterator each time
-    cnd_str = to_str(inputs[1])
+    cnd_str = to_str(inputs[2])
     target_strings = to_str(targets[0])
     out = model.forward_pass(inputs, training=False)
 
     zero_ins = [i[:1] for i in inputs]
-    zero_condition = zero_ins[1]
+    zero_condition = zero_ins[2]
     zero_ins[0] = tf.zeros_like(zero_ins[0])
     full_gen_out = model.forward_pass(zero_ins , training=False)
     full_gen_score = tf.nn.sigmoid(full_gen_out[0][-3]).numpy()
@@ -409,6 +384,7 @@ def char_predict(model, dataset, num):
     generated = to_str(generated)
     lm_str = to_str(logits)
     masked_str = to_str(inputs[0])
+    masked_denoiser_str = to_str(inputs[1])
     real_str = to_str(real)
     fake_str = to_str(fake)
 
@@ -419,6 +395,8 @@ def char_predict(model, dataset, num):
         print(cnd_str[i] + '|' + generated[i])
         print('--')
         print(cnd_str[i] + '|' + target_strings[i])
+        print('--')
+        print(cnd_str[i] + '|' + masked_denoiser_str[i])
         print('--')
         print(cnd_str[i] + '|' + masked_str[i])
         print('\n------\n')
