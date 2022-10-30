@@ -189,12 +189,13 @@ class Model(tf.keras.Model):
         return tf.cast(correct & confident, x.dtype)
 
     def forward_pass(self, inputs, training):
-        fullmask = self.maskid * tf.ones_like(inputs[0])
-        fullmask_hot = tf.one_hot(fullmask, depth=256)
+        maskid_hot = tf.one_hot(self.maskid, depth=256)[tf.newaxis, tf.newaxis, :]
+
         gen_masked = inputs[0]
         gen_masked_hot = tf.one_hot(gen_masked, depth=256)
         denoise_masked = tf.one_hot(inputs[1], depth=256)
-        alt_denoise_masked = tf.one_hot(inputs[2], depth=256)
+        alt_denoise_masked = inputs[2]
+        alt_denoise_masked_hot = tf.one_hot(alt_denoise_masked, depth=256)
         condition = tf.one_hot(inputs[3], depth=256)
         clean = inputs[4]
         hot_clean = tf.one_hot(clean, depth=256)
@@ -208,42 +209,56 @@ class Model(tf.keras.Model):
                                                    gen_masked_hot))
         gen_hot = tf.one_hot(tf.argmax(gen_logits, axis=-1), depth=256)
         gen_hot = tf.stop_gradient(gen_hot)
+        temperature = 1.0
+        gen_sampled = tf.random.categorical(tf.reshape(gen_logits/temperature, [-1, 256]), 1)
+        gen_sampled = tf.reshape(gen_sampled, [batchsize, seqlen])
+        gen_sampled_hot_x = tf.one_hot(gen_sampled, depth=256)
+        gen_sampled = tf.random.categorical(tf.reshape(gen_logits/temperature, [-1, 256]), 1)
+        gen_sampled = tf.reshape(gen_sampled, [batchsize, seqlen])
+        gen_sampled_hot_y = tf.one_hot(gen_sampled, depth=256)
 
-        # Prepare denoiser inputs
-        sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
-        x = tf.where(sample < 0.5, fullmask_hot, hot_clean)
-        sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
-        y = tf.where(sample < 0.5, fullmask_hot, gen_hot)
-        # Randomly swap inputs
-        coin = tf.cast(tf.random.uniform((batchsize, 1, 1), maxval=2, dtype=tf.int32), tf.float32)
-        x_ = coin * x + (1 - coin) * y
-        y_ = coin * y + (1 - coin) * x
-        # Run the generator to denoise the inputs
-        lm_logits, _ = self.generator((condition, x_, y_))
 
         # Run generator to get targets
-        sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
-        a = tf.where(sample < 0.5, fullmask_hot, gen_hot)
-        b = tf.where(sample > 0.5, fullmask_hot, gen_hot)
-        regen_logits, d_attn_weights = self.generator((condition, a, b), training=False)
+        regen_logits, d_attn_weights = self.generator((condition, gen_sampled_hot_x, gen_sampled_hot_y), training=False)
         regen_hot = tf.one_hot(tf.argmax(regen_logits, axis=-1), depth=256)
-        # Losses
-        gen_loss = self.xe_loss(regen_hot, gen_logits)
-        copy_loss = 10*self.xe_loss(hot_clean, gen_logits, tf.where(gen_masked == self.maskid, 0, 1))
 
+
+        # Run the generator on mixed real/generated inputs to learn denoising
+        sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
+        x = tf.where(sample < 0.5, regen_hot, hot_clean)
+        sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
+        y = tf.where(sample < 0.5, regen_hot, hot_clean)
+        lm_logits, _ = self.generator((condition, x, y))
+
+        # Losses
         gen_prob = tf.nn.softmax(gen_logits)
-        real = alt_denoise_masked
-        return ((lm_logits,
+        regen_prob = tf.nn.softmax(regen_logits)
+        regen_confidence = tf.stop_gradient(tf.reduce_max(regen_prob, axis=-1))
+        gen_loss = self.xe_loss(regen_hot, gen_logits, regen_confidence)
+        den_loss = self.xe_loss(hot_clean, lm_logits)
+        weights = tf.reduce_max(gen_prob, axis=-1)
+        gen_lm_loss = 0*self.xe_loss(hot_clean[:, :2], gen_logits[:, :2], weights[:, :2])
+        copy_loss = 1*self.xe_loss(hot_clean, gen_logits, tf.where(gen_masked == self.maskid, 0, 1))
+
+        clean_sum = tf.reduce_sum(hot_clean, axis=1)
+        gen_sum = tf.reduce_sum(gen_prob, axis=1)
+        unordered_loss = 0*self.cosine_loss(clean_sum, gen_sum)
+        diversity_loss = -0*self.cosine_loss(gen_sum, tf.roll(gen_sum, shift=1, axis=0))
+
+
+        real = alt_denoise_masked_hot
+        return ((copy_loss,
                  gen_loss,
-                 copy_loss),
+                 den_loss),
                 {'logits':lm_logits,
                  'denoiser_in':(x, y),
                  'denoiser_out':lm_logits,
                  'gen_logits': gen_logits,
                  'generated':gen_prob,
                  'regen_hot':regen_hot,
+                 'regen_prob':tf.nn.softmax(regen_logits),
                  'real':real,
-                 'alt_denoise_masked':alt_denoise_masked,
+                 'alt_denoise_masked':gen_masked_hot,
                  'gen_hot':gen_hot,
                  'attn_weights': attn_weights,
                  'd_attn_weights': d_attn_weights
@@ -330,14 +345,15 @@ def make_dataset(model, fpath, batchsize, seqlen, condlen, gramlen, shuffle, tra
             mask_rate = 0.5
             sample = np.random.uniform(size=(seqlen))
             pvals = scale([0.5*(1 - 0.5)**x for x in range(seqlen)]) # scaled geometric distribution
-            denoise_masked = np.where(sample < mask_rate, alt_center, center)
+            denoise_masked = np.where(sample < mask_rate, model.maskid, center)
 
             sample = np.random.uniform(size=(seqlen))
-            alt_denoise_masked = np.where(sample < mask_rate, center, alt_center)
+            alt_denoise_masked = np.where(sample < mask_rate, model.maskid, alt_center)
 
             sample = np.random.uniform(size=(seqlen))
-            mask_rate = np.random.uniform(0.25, 1.0)
+            mask_rate = np.random.uniform(0.75, 1.0)
             gen_masked = np.where(sample < mask_rate, model.maskid, center)
+
 
             yield ((gen_masked, alt_center, alt_denoise_masked, condition, center),
                     (center, center, center))
@@ -355,7 +371,6 @@ def make_dataset(model, fpath, batchsize, seqlen, condlen, gramlen, shuffle, tra
                     tf.TensorSpec(shape=(seqlen), dtype=tf.int32),
                     tf.TensorSpec(shape=(seqlen), dtype=tf.int32),
                     tf.TensorSpec(shape=(seqlen), dtype=tf.int32),
-
                 ),
 
             )
@@ -365,7 +380,7 @@ def make_dataset(model, fpath, batchsize, seqlen, condlen, gramlen, shuffle, tra
 
 
 
-def plots(generated, gen_hot, real, logits, gen_logits, idx, name):
+def plots(generated, regen_prob, real, logits, gen_logits, idx, name):
     xaxis = dict(
         tickmode = 'array',
         tickvals = list(range(256)),
@@ -387,9 +402,9 @@ def plots(generated, gen_hot, real, logits, gen_logits, idx, name):
     fig.update_layout(xaxis=xaxis)
     fig.write_html(f'y_{name}.html')
 
-    fig = px.imshow(gen_hot[idx], aspect='auto')
+    fig = px.imshow(regen_prob[idx], aspect='auto')
     fig.update_layout(xaxis=xaxis)
-    fig.write_html(f'x_gen_hot_{name}.html')
+    fig.write_html(f'x_regen_prob_{name}.html')
 
 def char_predict(model, dataset, num):
     inputs, targets = next(iter(dataset)) # NOTE this always grabs the 1st batch because its a new iterator each time
@@ -411,7 +426,7 @@ def char_predict(model, dataset, num):
     alt_denoise_masked = out[1]['alt_denoise_masked']
     logits = out[1]['logits']
     gen_logits = out[1]['gen_logits']
-    regen_hot = out[1]['regen_hot']
+    regen_prob = out[1]['regen_prob']
     denoiser_out = out[1]['denoiser_out']
     denoiser_x, denoiser_y = out[1]['denoiser_in']
     attn_weights = out[1]['attn_weights']
@@ -427,12 +442,12 @@ def char_predict(model, dataset, num):
         fig = px.imshow(aw, aspect='auto')
         fig.write_html(f'x_d_attn_{idx}.html')
 
-    plots(generated, gen_hot, real, logits, gen_logits, 0, 'worst')
-    plots(generated, gen_hot, real, logits, gen_logits, 1, 'best')
+    plots(generated, regen_prob, real, logits, gen_logits, 0, 'worst')
+    plots(generated, regen_prob, real, logits, gen_logits, 1, 'best')
 
     full_gen_out = tf.argmax(full_gen_out, axis=-1)
     generated = tf.argmax(generated, axis=-1)
-    regen_hot = tf.argmax(regen_hot, axis=-1)
+    regen_hot = tf.argmax(regen_prob, axis=-1)
     logits = tf.argmax(logits, axis=-1)
     real = tf.argmax(real, axis=-1)
     gen_hot = tf.argmax(gen_hot, axis=-1)
@@ -468,13 +483,14 @@ def char_predict(model, dataset, num):
         print('--')
         print(cnd_str[i] + '|' + generated[i])
         print('--')
-        print(cnd_str[i] + '|' + masked_str[i])
+#        print(cnd_str[i] + '|' + masked_str[i])
+        print(cnd_str[i] + '|' + alt_denoise_masked[i])
         print('--')
         print(cnd_str[i] + '|' + target_strings[i])
         print('--')
         print(cnd_str[i] + '|' + denoiser_out[i])
-        print('--')
-        print(cnd_str[i] + '|' + denoiser_y[i])
+#        print('--')
+#        print(cnd_str[i] + '|' + denoiser_y[i])
         print('--')
         print(cnd_str[i] + '|' + denoiser_x[i])
         print('\n------\n')
@@ -533,7 +549,7 @@ if __name__ == '__main__':
     norm_loss = NormLoss()
     through_loss = PassthroughLoss()
 
-    loss = (cat_loss, through_loss , through_loss)
+    loss = (through_loss, through_loss , through_loss, through_loss)
     model.compile(optimizer=optimizer, loss=loss, loss_weights=[1,1,1], metrics=[])
 
 
