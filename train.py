@@ -193,7 +193,8 @@ class Model(tf.keras.Model):
 
         gen_masked = inputs[0]
         gen_masked_hot = tf.one_hot(gen_masked, depth=256)
-        denoise_masked = tf.one_hot(inputs[1], depth=256)
+        alt_clean = tf.one_hot(inputs[1], depth=256)
+
         alt_denoise_masked = inputs[2]
         alt_denoise_masked_hot = tf.one_hot(alt_denoise_masked, depth=256)
         condition = tf.one_hot(inputs[3], depth=256)
@@ -202,42 +203,45 @@ class Model(tf.keras.Model):
 
         batchsize = tf.shape(gen_masked)[0]
         seqlen = tf.shape(gen_masked)[1]
-
         # Run generator
         gen_logits, attn_weights = self.generator((condition,
                                                    gen_masked_hot,
                                                    gen_masked_hot))
+        gen_prob = tf.nn.softmax(gen_logits)
         gen_hot = tf.one_hot(tf.argmax(gen_logits, axis=-1), depth=256)
         gen_hot = tf.stop_gradient(gen_hot)
-        temperature = 1.0
-        gen_sampled = tf.random.categorical(tf.reshape(gen_logits/temperature, [-1, 256]), 1)
-        gen_sampled = tf.reshape(gen_sampled, [batchsize, seqlen])
-        gen_sampled_hot_x = tf.one_hot(gen_sampled, depth=256)
-        gen_sampled = tf.random.categorical(tf.reshape(gen_logits/temperature, [-1, 256]), 1)
-        gen_sampled = tf.reshape(gen_sampled, [batchsize, seqlen])
-        gen_sampled_hot_y = tf.one_hot(gen_sampled, depth=256)
-
 
         # Run generator to get targets
-        regen_logits, d_attn_weights = self.generator((condition, gen_sampled_hot_x, gen_sampled_hot_y), training=False)
+        sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
+        x = tf.where(sample < 0.5, maskid_hot, gen_hot)
+        sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
+        y = tf.where(sample < 0.5, maskid_hot, gen_hot)
+        regen_logits, d_attn_weights = self.generator((condition, x, y), training=False)
+        regen_prob = tf.nn.softmax(regen_logits)
         regen_hot = tf.one_hot(tf.argmax(regen_logits, axis=-1), depth=256)
 
-
-        # Run the generator on mixed real/generated inputs to learn denoising
+        # Run the generator on mixed real/fake inputs to learn contrastive MLM
+        noise = maskid_hot
+        coin = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
+        noise = tf.where(coin < 0.5, maskid_hot, gen_hot)
         sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
-        x = tf.where(sample < 0.5, regen_hot, hot_clean)
+        x = tf.where(sample < 0.5, noise, hot_clean)
         sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
-        y = tf.where(sample < 0.5, regen_hot, hot_clean)
-        lm_logits, _ = self.generator((condition, x, y))
+        y = tf.where(sample < 0.5, noise, gen_hot)
+        coin = tf.random.uniform([batchsize, 1, 1], 0, 1)
+        tmpx = tf.where(coin < 0.5, x, y)
+        y = tf.where(coin < 0.5, y, x)
+        x = tmpx
+        contrast_logits, _ = self.generator((condition, x, y))
+        lm_hot = tf.one_hot(tf.argmax(contrast_logits, axis=-1), depth=256)
+        lm_logits = contrast_logits
 
         # Losses
-        gen_prob = tf.nn.softmax(gen_logits)
-        regen_prob = tf.nn.softmax(regen_logits)
         regen_confidence = tf.stop_gradient(tf.reduce_max(regen_prob, axis=-1))
-        gen_loss = self.xe_loss(regen_hot, gen_logits, regen_confidence)
-        den_loss = self.xe_loss(hot_clean, lm_logits)
-        weights = tf.reduce_max(gen_prob, axis=-1)
-        gen_lm_loss = 0*self.xe_loss(hot_clean[:, :2], gen_logits[:, :2], weights[:, :2])
+        gen_loss = self.xe_loss(tf.stop_gradient(regen_prob), gen_logits, regen_confidence)
+#        gen_loss = self.xe_loss(regen_hot, gen_logits, regen_confidence)
+        den_loss = 0*self.xe_loss(hot_clean, lm_logits)
+        con_loss = self.xe_loss(hot_clean, contrast_logits)
         copy_loss = 1*self.xe_loss(hot_clean, gen_logits, tf.where(gen_masked == self.maskid, 0, 1))
 
         clean_sum = tf.reduce_sum(hot_clean, axis=1)
@@ -245,20 +249,20 @@ class Model(tf.keras.Model):
         unordered_loss = 0*self.cosine_loss(clean_sum, gen_sum)
         diversity_loss = -0*self.cosine_loss(gen_sum, tf.roll(gen_sum, shift=1, axis=0))
 
-
         real = alt_denoise_masked_hot
         return ((copy_loss,
                  gen_loss,
-                 den_loss),
+                 den_loss,
+                 con_loss),
                 {'logits':lm_logits,
-                 'denoiser_in':(x, y),
+                 'denoiser_in':(x, x),
                  'denoiser_out':lm_logits,
                  'gen_logits': gen_logits,
                  'generated':gen_prob,
                  'regen_hot':regen_hot,
                  'regen_prob':tf.nn.softmax(regen_logits),
                  'real':real,
-                 'alt_denoise_masked':gen_masked_hot,
+                 'alt_denoise_masked':gen_masked_hot, # FIXME
                  'gen_hot':gen_hot,
                  'attn_weights': attn_weights,
                  'd_attn_weights': d_attn_weights
@@ -356,7 +360,7 @@ def make_dataset(model, fpath, batchsize, seqlen, condlen, gramlen, shuffle, tra
 
 
             yield ((gen_masked, alt_center, alt_denoise_masked, condition, center),
-                    (center, center, center))
+                    (center, center, center,center))
     dataset = tf.data.Dataset.from_generator(
             gen,
             output_signature = (
@@ -368,6 +372,7 @@ def make_dataset(model, fpath, batchsize, seqlen, condlen, gramlen, shuffle, tra
                     tf.TensorSpec(shape=(seqlen), dtype=tf.int32),
                 ),
                 (
+                    tf.TensorSpec(shape=(seqlen), dtype=tf.int32),
                     tf.TensorSpec(shape=(seqlen), dtype=tf.int32),
                     tf.TensorSpec(shape=(seqlen), dtype=tf.int32),
                     tf.TensorSpec(shape=(seqlen), dtype=tf.int32),
@@ -550,7 +555,7 @@ if __name__ == '__main__':
     through_loss = PassthroughLoss()
 
     loss = (through_loss, through_loss , through_loss, through_loss)
-    model.compile(optimizer=optimizer, loss=loss, loss_weights=[1,1,1], metrics=[])
+    model.compile(optimizer=optimizer, loss=loss, loss_weights=[1,1,1,1], metrics=[])
 
 
     logits = model(inputs) # Running the model builds all the layers
