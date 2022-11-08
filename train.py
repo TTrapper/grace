@@ -190,6 +190,7 @@ class Model(tf.keras.Model):
 
     def forward_pass(self, inputs, training):
         maskid_hot = tf.one_hot(self.maskid, depth=256)[tf.newaxis, tf.newaxis, :]
+        padid_hot = tf.one_hot(self.maskid+1, depth=256)[tf.newaxis, tf.newaxis, :]
 
         gen_masked = inputs[0]
         gen_masked_hot = tf.one_hot(gen_masked, depth=256)
@@ -203,35 +204,60 @@ class Model(tf.keras.Model):
 
         batchsize = tf.shape(gen_masked)[0]
         seqlen = tf.shape(gen_masked)[1]
+
         # Run generator
+        sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
+        noise = tf.where(sample < 0.0, padid_hot, maskid_hot)
+#        noise = tf.where(gen_masked[:, :, tf.newaxis] == self.maskid, gen_masked_hot, alt_clean)
         gen_logits, attn_weights = self.generator((condition,
                                                    gen_masked_hot,
-                                                   gen_masked_hot))
+                                                   noise))
         gen_prob = tf.nn.softmax(gen_logits)
         gen_hot = tf.one_hot(tf.argmax(gen_logits, axis=-1), depth=256)
         gen_hot = tf.stop_gradient(gen_hot)
 
         # Run generator to get targets
-        sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
-        x = tf.where(sample < 0.5, maskid_hot, gen_hot)
-        sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
-        y = tf.where(sample < 0.5, maskid_hot, gen_hot)
+#        sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
+#        x = tf.where(sample < 0.25, alt_clean, gen_hot)
+#        sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
+#        y = tf.where(sample < 0.25, alt_clean, gen_hot)
+        x = tf.where(gen_masked[:, :, tf.newaxis] == self.maskid, gen_hot, alt_clean)
+        y = tf.where(gen_masked[:, :, tf.newaxis] == self.maskid, gen_hot, hot_clean)
+
+        x = tf.where(sample < 0.0, maskid_hot, gen_hot)
+        y = tf.where(sample < 0.0, maskid_hot, gen_hot)
+
         regen_logits, d_attn_weights = self.generator((condition, x, y), training=False)
         regen_prob = tf.nn.softmax(regen_logits)
         regen_hot = tf.one_hot(tf.argmax(regen_logits, axis=-1), depth=256)
 
+        """
+        seqmask = tf.random.uniform([batchsize], 0, seqlen, dtype=tf.int32)
+        seqmask = tf.sequence_mask(seqmask, maxlen=seqlen, dtype=gen_hot.dtype)[:, :, tf.newaxis]
+#        print(seqmask)
+        sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
+        mostly_clean = tf.where(sample < 0.05, gen_hot, hot_clean)
+        mostly_gen = tf.where(sample < 0.05, hot_clean, gen_hot)
+        x = seqmask * mostly_clean + (1 - seqmask) * mostly_gen
+        y = (1 - seqmask) * mostly_clean + seqmask * mostly_gen
+        coin = tf.random.uniform([batchsize, 1, 1], 0, 1)
+        x = tf.where(coin < 0.5, x, y)
+        y = x
+        """
         # Run the generator on mixed real/fake inputs to learn contrastive MLM
-        noise = maskid_hot
-        coin = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
-        noise = tf.where(coin < 0.5, maskid_hot, gen_hot)
+        mask_rate = tf.random.uniform([batchsize, 1, 1], 0.25, 0.5)
         sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
-        x = tf.where(sample < 0.5, noise, hot_clean)
+        x = tf.where(sample < mask_rate, gen_hot, hot_clean)
+        y = x
+        """
         sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
-        y = tf.where(sample < 0.5, noise, gen_hot)
+        y = tf.where(sample < 0.5, gen_hot, alt_clean)
+        # Randomize the input order of real/fake inputs
         coin = tf.random.uniform([batchsize, 1, 1], 0, 1)
         tmpx = tf.where(coin < 0.5, x, y)
         y = tf.where(coin < 0.5, y, x)
         x = tmpx
+        """
         contrast_logits, _ = self.generator((condition, x, y))
         lm_hot = tf.one_hot(tf.argmax(contrast_logits, axis=-1), depth=256)
         lm_logits = contrast_logits
@@ -247,12 +273,14 @@ class Model(tf.keras.Model):
         clean_sum = tf.reduce_sum(hot_clean, axis=1)
         gen_sum = tf.reduce_sum(gen_prob, axis=1)
         unordered_loss = 0*self.cosine_loss(clean_sum, gen_sum)
-        diversity_loss = -0*self.cosine_loss(gen_sum, tf.roll(gen_sum, shift=1, axis=0))
+        clean_sim = (1 + self.cosine_loss(clean_sum, tf.roll(clean_sum, shift=1, axis=0))) / 2
+#        print(clean_sim)
+        diversity_loss = -0*self.cosine_loss(gen_sum, tf.roll(gen_sum, shift=1, axis=0), clean_sim)
 
         real = alt_denoise_masked_hot
         return ((copy_loss,
                  gen_loss,
-                 den_loss,
+                 diversity_loss,
                  con_loss),
                 {'logits':lm_logits,
                  'denoiser_in':(x, x),
@@ -355,7 +383,7 @@ def make_dataset(model, fpath, batchsize, seqlen, condlen, gramlen, shuffle, tra
             alt_denoise_masked = np.where(sample < mask_rate, model.maskid, alt_center)
 
             sample = np.random.uniform(size=(seqlen))
-            mask_rate = np.random.uniform(0.75, 1.0)
+            mask_rate = np.random.uniform(1.0, 1.0)
             gen_masked = np.where(sample < mask_rate, model.maskid, center)
 
 
