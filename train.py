@@ -70,7 +70,7 @@ class MultiHeadAttention(tf.keras.layers.Layer):
     x = tf.reshape(x, (batch_size, -1, self.num_heads, self.depth))
     return tf.transpose(x, perm=[0, 2, 1, 3])
 
-  def call(self, v, k, q, mask):
+  def call(self, v, k, q, mask=None):
     batch_size = tf.shape(q)[0]
 
     q = self.wq(q)  # (batch_size, seq_len, d_model)
@@ -140,26 +140,35 @@ class Model(tf.keras.Model):
         nheads = self.num_heads
 
         condition_inputs = tf.keras.Input(shape=(None, 256), name='condition_inputs') # one-hot bytes
-        inputs = tf.keras.Input(shape=(None, 256), name='inputs') # one-hot bytes
-        alt_inputs = tf.keras.Input(shape=(None, 256), name='alt_inputs') # one-hot bytes
-        mixed_inputs = tf.keras.layers.Dense(256)(tf.concat([inputs, alt_inputs], axis=-1))
+        inputs0 = tf.keras.Input(shape=(None, 256), name='inputs0') # one-hot bytes
+        inputs1 = tf.keras.Input(shape=(None, 256), name='inputs1') # one-hot bytes
+        inputs2 = tf.keras.Input(shape=(None, 256), name='inputs2') # one-hot bytes
+        inputs3 = tf.keras.Input(shape=(None, 256), name='inputs3') # one-hot bytes
+        input_projection = tf.keras.layers.Dense(64)
+        inputs = [input_projection(i) for i in [inputs0, inputs1, inputs2, inputs3]]
+        mixed_inputs = tf.concat(inputs, axis=-1)
 
         condlen = tf.shape(condition_inputs)[1]
-        seqlen = tf.shape(inputs)[1]
-        batchsize = tf.shape(inputs)[0]
+        seqlen = tf.shape(inputs0)[1]
+        batchsize = tf.shape(inputs0)[0]
 
-        pos = tf.one_hot(tf.range(condlen + seqlen), depth=256)[tf.newaxis, :, :]
+        maxlen = 512
+        condition_pos = tf.reverse(tf.range(condlen), axis=[0])
+        latent_pos = tf.reverse(tf.range(maxlen - seqlen, maxlen), axis=[0])
+        pos = tf.concat([condition_pos, latent_pos], axis=0)
+        pos = tf.one_hot(pos, depth=maxlen)[tf.newaxis, :, :]
         pos = tf.tile(pos, [batchsize, 1, 1])
+        
         x = tf.concat([condition_inputs, mixed_inputs], axis=1)
         x = tf.concat([x, pos], axis=-1)
-        x = tf.keras.layers.Dense(d_model, tf.nn.relu)(x)
+        x = tf.keras.layers.Dense(d_model, tf.nn.relu)(x) # char + position + latent query embeds
         outs = []
         attention_weights = []
         q = x[:, condlen:]
         condition = x[:, :condlen]
-
+        kv = condition
         for i in range(16):
-            attn_out, attn_weights = MultiHeadAttention(d_model, nheads)(x,x,q, None)
+            attn_out, attn_weights = MultiHeadAttention(d_model, nheads)(kv, kv, q)
             attention_weights.append(attn_weights)
             attn_out = tf.keras.layers.LayerNormalization(epsilon=1e-6)(attn_out + q)
             attn_out = tf.keras.layers.Dropout(rate=dropout)(attn_out)
@@ -172,21 +181,43 @@ class Model(tf.keras.Model):
             c = tf.keras.layers.Dropout(rate=dropout)(c)
             c = tf.keras.layers.Dense(d_model, None)(c)
             q = tf.keras.layers.LayerNormalization(epsilon=1e-6)(c + attn_out)
-            x = q
+            kv = q
             if i % 8 == 7:
-                x = tf.concat([condition, q], axis=1)
+                kv = condition
                 outs.append(q)
         x = tf.concat(outs, axis=-1)
-        return tf.keras.Model(inputs=(condition_inputs, inputs, alt_inputs), outputs=(x, attention_weights))
+        return tf.keras.Model(
+                inputs=(condition_inputs, inputs0, inputs1, inputs2, inputs3),
+                outputs=(x, attention_weights)
+        )
 
     def make_generator(self, backbone):
+        real_logits = tf.keras.layers.Dense(256)(backbone.outputs[0])
+        fake_logits = tf.keras.layers.Dense(256)(backbone.outputs[0])
+        alt_logits = tf.keras.layers.Dense(256)(backbone.outputs[0])
         gen_logits = tf.keras.layers.Dense(256)(backbone.outputs[0])
-        return tf.keras.Model(inputs=backbone.inputs, outputs=(gen_logits, (backbone.outputs[1:])))
+        return tf.keras.Model(
+                inputs=backbone.inputs,
+                outputs=(
+                    real_logits,
+                    fake_logits,
+                    alt_logits,
+                    gen_logits,
+                    (backbone.outputs[1:])
+                )
+        )
 
     def confidently_correct(self, x, y, min_confidence=0.99):
         correct = tf.argmax(x, axis=-1) == tf.argmax(y, axis=-1)
         confident = tf.reduce_max(x, axis=-1) > min_confidence
         return tf.cast(correct & confident, x.dtype)
+
+    def sample_logits(self, logits, temperature):
+        batchsize = tf.shape(logits)[0]
+        seqlen = tf.shape(logits)[1]
+        sampled = tf.random.categorical(tf.reshape(logits/temperature, [-1, 256]), 1)
+        sampled = tf.reshape(sampled, [batchsize, seqlen])
+        return tf.one_hot(sampled, depth=256)
 
     def forward_pass(self, inputs, training):
         maskid_hot = tf.one_hot(self.maskid, depth=256)[tf.newaxis, tf.newaxis, :]
@@ -206,91 +237,87 @@ class Model(tf.keras.Model):
         seqlen = tf.shape(gen_masked)[1]
 
         # Run generator
-        sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
-        noise = tf.where(sample < 0.0, padid_hot, maskid_hot)
-#        noise = tf.where(gen_masked[:, :, tf.newaxis] == self.maskid, gen_masked_hot, alt_clean)
-        gen_logits, attn_weights = self.generator((condition,
-                                                   gen_masked_hot,
-                                                   noise))
+        mask_rate = 0.25
+        sample0 = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
+        gen_in0 = tf.where(sample0 < mask_rate, maskid_hot, padid_hot)
+        clean_sum = tf.reduce_sum(hot_clean, axis=1, keepdims=True) + 0 * gen_in0
+        _, _, _, gen_logits, attn_weights = self.generator((
+                                                    condition,
+                                                    gen_in0,
+                                                    gen_in0,
+                                                    gen_in0,
+                                                    0*clean_sum)) #FIXME  0 in
         gen_prob = tf.nn.softmax(gen_logits)
         gen_hot = tf.one_hot(tf.argmax(gen_logits, axis=-1), depth=256)
-        gen_hot = tf.stop_gradient(gen_hot)
+        gen_hot = tf.stop_gradient(gen_hot) 
 
-        # Run generator to get targets
-#        sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
-#        x = tf.where(sample < 0.25, alt_clean, gen_hot)
-#        sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
-#        y = tf.where(sample < 0.25, alt_clean, gen_hot)
-        x = tf.where(gen_masked[:, :, tf.newaxis] == self.maskid, gen_hot, alt_clean)
-        y = tf.where(gen_masked[:, :, tf.newaxis] == self.maskid, gen_hot, hot_clean)
-
-        x = tf.where(sample < 0.0, maskid_hot, gen_hot)
-        y = tf.where(sample < 0.0, maskid_hot, gen_hot)
-
-        regen_logits, d_attn_weights = self.generator((condition, x, y), training=False)
+        # Denoise generated outputs to produce training targets
+        noise = maskid_hot#hot_clean#self.sample_logits(gen_logits, 0.75)
+        in0 = tf.where(sample0 < mask_rate, gen_hot, gen_hot) # FIXME not masking
+        in1 = tf.where(sample0 < mask_rate, noise, gen_hot)
+#        in2 = tf.where(sample2 < mask_rate, noise, gen_hot)
+        in2 = in0
+        regen_logits, _, _, _, _ = self.generator((condition, in0, in1, in2, 0 * in0), training=False) # FIXME 0 in
         regen_prob = tf.nn.softmax(regen_logits)
         regen_hot = tf.one_hot(tf.argmax(regen_logits, axis=-1), depth=256)
 
-        """
-        seqmask = tf.random.uniform([batchsize], 0, seqlen, dtype=tf.int32)
-        seqmask = tf.sequence_mask(seqmask, maxlen=seqlen, dtype=gen_hot.dtype)[:, :, tf.newaxis]
-#        print(seqmask)
-        sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
-        mostly_clean = tf.where(sample < 0.05, gen_hot, hot_clean)
-        mostly_gen = tf.where(sample < 0.05, hot_clean, gen_hot)
-        x = seqmask * mostly_clean + (1 - seqmask) * mostly_gen
-        y = (1 - seqmask) * mostly_clean + seqmask * mostly_gen
-        coin = tf.random.uniform([batchsize, 1, 1], 0, 1)
-        x = tf.where(coin < 0.5, x, y)
-        y = x
-        """
-        # Run the generator on mixed real/fake inputs to learn contrastive MLM
-        mask_rate = tf.random.uniform([batchsize, 1, 1], 0.25, 0.5)
+        # Create noise by mixing various inputs with mask tokens
+#        sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
+#        noise = tf.where(sample < 0.25, hot_clean, maskid_hot)
+#        noise = tf.where((0.25 < sample) & (sample < 0.5), gen_hot, noise)
+#        noise = tf.where((0.5 < sample) & (sample < 0.75), alt_clean, noise)
+        # Randomly apply noise
+        mask_rate = tf.random.uniform([batchsize, 1, 1], 0.25, 0.7)
         sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
         x = tf.where(sample < mask_rate, gen_hot, hot_clean)
-        y = x
-        """
-        sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
-        y = tf.where(sample < 0.5, gen_hot, alt_clean)
+#        sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
+        coin = tf.random.uniform([batchsize, 1, 1], 0, 1) 
+        y = tf.where(sample < mask_rate, maskid_hot, hot_clean)
+        y_ = tf.where(sample < mask_rate, gen_hot, maskid_hot)
+        y = tf.where(coin < 0.5, y, y_)
+#        sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
+#        z = tf.where(sample < mask_rate, gen_hot, maskid_hot) 
         # Randomize the input order of real/fake inputs
-        coin = tf.random.uniform([batchsize, 1, 1], 0, 1)
-        tmpx = tf.where(coin < 0.5, x, y)
-        y = tf.where(coin < 0.5, y, x)
-        x = tmpx
-        """
-        contrast_logits, _ = self.generator((condition, x, y))
-        lm_hot = tf.one_hot(tf.argmax(contrast_logits, axis=-1), depth=256)
-        lm_logits = contrast_logits
+#        y = x
+        z = x
+#        xyz = tf.stack([x, y, z], axis=1)
+#        xyz = tf.map_fn(lambda x: tf.gather(x, tf.random.shuffle(tf.range(3))), xyz)
+#        x, y, z = tf.unstack(xyz, axis=1)
+        # Run the generator on noisy real/fake inputs to learn a language model
+        real_logits, fake_logits, alt_logits, _, d_attn_weights = self.generator((condition, x, y, z, 0 * x)) # FIXME 0 in
+        real_prob = tf.nn.softmax(real_logits)
+
 
         # Losses
         regen_confidence = tf.stop_gradient(tf.reduce_max(regen_prob, axis=-1))
         gen_loss = self.xe_loss(tf.stop_gradient(regen_prob), gen_logits, regen_confidence)
-#        gen_loss = self.xe_loss(regen_hot, gen_logits, regen_confidence)
-        den_loss = 0*self.xe_loss(hot_clean, lm_logits)
-        con_loss = self.xe_loss(hot_clean, contrast_logits)
-        copy_loss = 1*self.xe_loss(hot_clean, gen_logits, tf.where(gen_masked == self.maskid, 0, 1))
+        real_loss = self.xe_loss(hot_clean, real_logits)
+        fake_loss = self.xe_loss(gen_hot, fake_logits)
+        alt_loss = self.xe_loss(alt_clean, alt_logits)
 
+        copy_loss = 1*self.xe_loss(hot_clean, gen_logits, tf.where(gen_masked == self.maskid, 0, 1))
         clean_sum = tf.reduce_sum(hot_clean, axis=1)
         gen_sum = tf.reduce_sum(gen_prob, axis=1)
-        unordered_loss = 0*self.cosine_loss(clean_sum, gen_sum)
-        clean_sim = (1 + self.cosine_loss(clean_sum, tf.roll(clean_sum, shift=1, axis=0))) / 2
-#        print(clean_sim)
-        diversity_loss = -0*self.cosine_loss(gen_sum, tf.roll(gen_sum, shift=1, axis=0), clean_sim)
+        regen_sum = tf.reduce_sum(regen_prob, axis=1)
+        real_sum = tf.reduce_sum(real_prob, axis=1)
+        realism_loss = 10*self.cosine_loss(clean_sum, gen_sum)
+        realism_loss += 1*self.cosine_loss(clean_sum, regen_sum)
+        realism_loss += 1*self.cosine_loss(clean_sum, real_sum)
+        clean_sim = (1 + self.cosine_loss(hot_clean, tf.roll(hot_clean, shift=1, axis=0))) / 2
+        diversity_loss = -1*self.cosine_loss(gen_prob, tf.roll(gen_prob, shift=1, axis=0))
+        diversity_loss = 1*tf.nn.relu(diversity_loss - (1 - clean_sim))
 
-        real = alt_denoise_masked_hot
-        return ((copy_loss,
+        return ((real_loss,
+                 fake_loss,
+                 0*alt_loss,
                  gen_loss,
-                 diversity_loss,
-                 con_loss),
-                {'logits':lm_logits,
-                 'denoiser_in':(x, x),
-                 'denoiser_out':lm_logits,
+                 0*realism_loss),
+                {'denoiser_in':(x, x),
                  'gen_logits': gen_logits,
                  'generated':gen_prob,
                  'regen_hot':regen_hot,
-                 'regen_prob':tf.nn.softmax(regen_logits),
-                 'real':real,
-                 'alt_denoise_masked':gen_masked_hot, # FIXME
+                 'regen_prob':regen_prob,
+                 'real_prob':real_prob,
                  'gen_hot':gen_hot,
                  'attn_weights': attn_weights,
                  'd_attn_weights': d_attn_weights
@@ -388,7 +415,7 @@ def make_dataset(model, fpath, batchsize, seqlen, condlen, gramlen, shuffle, tra
 
 
             yield ((gen_masked, alt_center, alt_denoise_masked, condition, center),
-                    (center, center, center,center))
+                    (center, center, center, center, center))
     dataset = tf.data.Dataset.from_generator(
             gen,
             output_signature = (
@@ -399,7 +426,8 @@ def make_dataset(model, fpath, batchsize, seqlen, condlen, gramlen, shuffle, tra
                     tf.TensorSpec(shape=(condlen), dtype=tf.int32),
                     tf.TensorSpec(shape=(seqlen), dtype=tf.int32),
                 ),
-                (
+                ( 
+                    tf.TensorSpec(shape=(seqlen), dtype=tf.int32),
                     tf.TensorSpec(shape=(seqlen), dtype=tf.int32),
                     tf.TensorSpec(shape=(seqlen), dtype=tf.int32),
                     tf.TensorSpec(shape=(seqlen), dtype=tf.int32),
@@ -413,27 +441,19 @@ def make_dataset(model, fpath, batchsize, seqlen, condlen, gramlen, shuffle, tra
 
 
 
-def plots(generated, regen_prob, real, logits, gen_logits, idx, name):
+def plots(gen_prob, regen_prob, real_prob, idx, name):
     xaxis = dict(
         tickmode = 'array',
         tickvals = list(range(256)),
         ticktext = [chr(i) for i in range(256)]
     )
-    fig = px.imshow(tf.nn.softmax(logits[idx], axis=-1), aspect='auto')
+    fig = px.imshow(tf.nn.softmax(real_prob[idx], axis=-1), aspect='auto')
     fig.update_layout(xaxis=xaxis)
-    fig.write_html(f'x_lm_{name}.html')
+    fig.write_html(f'x_real_prob_{name}.html')
 
-    fig = px.imshow(gen_logits[idx], aspect='auto')
+    fig = px.imshow(gen_prob[idx], aspect='auto')
     fig.update_layout(xaxis=xaxis)
-    fig.write_html(f'x_gen_log_{name}.html')
-
-    fig = px.imshow(generated[idx], aspect='auto')
-    fig.update_layout(xaxis=xaxis)
-    fig.write_html(f'x_gen_{name}.html')
-
-    fig = px.imshow(real[idx], aspect='auto')
-    fig.update_layout(xaxis=xaxis)
-    fig.write_html(f'y_{name}.html')
+    fig.write_html(f'x_gen_prob_{name}.html')
 
     fig = px.imshow(regen_prob[idx], aspect='auto')
     fig.update_layout(xaxis=xaxis)
@@ -455,12 +475,9 @@ def char_predict(model, dataset, num):
 
     generated = out[1]['generated']
     gen_hot = out[1]['gen_hot']
-    real = out[1]['real']
-    alt_denoise_masked = out[1]['alt_denoise_masked']
-    logits = out[1]['logits']
+    real_prob = out[1]['real_prob']
     gen_logits = out[1]['gen_logits']
     regen_prob = out[1]['regen_prob']
-    denoiser_out = out[1]['denoiser_out']
     denoiser_x, denoiser_y = out[1]['denoiser_in']
     attn_weights = out[1]['attn_weights']
     for idx, aw in enumerate(attn_weights):
@@ -475,53 +492,49 @@ def char_predict(model, dataset, num):
         fig = px.imshow(aw, aspect='auto')
         fig.write_html(f'x_d_attn_{idx}.html')
 
-    plots(generated, regen_prob, real, logits, gen_logits, 0, 'worst')
-    plots(generated, regen_prob, real, logits, gen_logits, 1, 'best')
+    plots(generated, regen_prob, real_prob, 0, 'worst')
+    plots(generated, regen_prob, real_prob, 1, 'best')
 
     full_gen_out = tf.argmax(full_gen_out, axis=-1)
     generated = tf.argmax(generated, axis=-1)
     regen_hot = tf.argmax(regen_prob, axis=-1)
-    logits = tf.argmax(logits, axis=-1)
-    real = tf.argmax(real, axis=-1)
+    real_hot = tf.argmax(real_prob, axis=-1)
     gen_hot = tf.argmax(gen_hot, axis=-1)
-    denoiser_out = tf.argmax(denoiser_out, axis=-1)
     denoiser_x = tf.argmax(denoiser_x, axis=-1)
     denoiser_y = tf.argmax(denoiser_y, axis=-1)
-    alt_denoise_masked = tf.argmax(alt_denoise_masked, axis=-1)
+
 
     zero_ins = to_str(zero_ins[0])
     zero_condition = to_str(zero_condition)
     full_gen_out = to_str(full_gen_out)
     generated = to_str(generated)
     regen_hot = to_str(regen_hot)
-    lm_str = to_str(logits)
     masked_str = to_str(inputs[0])
     masked_denoiser_str = to_str(inputs[1])
     masked_denoiser_alt_str = to_str(inputs[2])
-    alt_denoise_masked = to_str(alt_denoise_masked)
-    real_str = to_str(real)
+    real_str = to_str(real_hot)
     gen_hot_str = to_str(gen_hot)
-    denoiser_out = to_str(denoiser_out)
+
     denoiser_x = to_str(denoiser_x)
     denoiser_y = to_str(denoiser_y)
 
     print('--\n')
-
+    """
     print(zero_condition[0] + '|' + full_gen_out[0])
     print('--')
     print(zero_condition[0] + '|' + zero_ins[0])
     print('\n------\n')
+    """
     for i in range(num):
         print(cnd_str[i] + '|' + regen_hot[i])
         print('--')
         print(cnd_str[i] + '|' + generated[i])
         print('--')
 #        print(cnd_str[i] + '|' + masked_str[i])
-        print(cnd_str[i] + '|' + alt_denoise_masked[i])
         print('--')
         print(cnd_str[i] + '|' + target_strings[i])
         print('--')
-        print(cnd_str[i] + '|' + denoiser_out[i])
+        print(cnd_str[i] + '|' + real_str[i])
 #        print('--')
 #        print(cnd_str[i] + '|' + denoiser_y[i])
         print('--')
@@ -547,7 +560,7 @@ if __name__ == '__main__':
     enc_depth = 8
     dropout = 0.01
     batchsize = 256
-    condlen = 32
+    condlen = 64
     seqlen = 32
     gramlen = 5
     gen_noise = 0.0
@@ -582,8 +595,8 @@ if __name__ == '__main__':
     norm_loss = NormLoss()
     through_loss = PassthroughLoss()
 
-    loss = (through_loss, through_loss , through_loss, through_loss)
-    model.compile(optimizer=optimizer, loss=loss, loss_weights=[1,1,1,1], metrics=[])
+    loss = through_loss
+    model.compile(optimizer=optimizer, loss=loss, loss_weights=[1,1,1,1,1], metrics=[])
 
 
     logits = model(inputs) # Running the model builds all the layers
@@ -615,28 +628,3 @@ if __name__ == '__main__':
 
     if args.eval:
         model.evaluate(valid_dataset)
-
-    """
-    with tf.GradientTape() as tape:
-
-        # Run the forward pass of the layer.
-        # The operations that the layer applies
-        # to its inputs are going to be recorded
-        # on the GradientTape.
-        logits = model(inputs, training=True)  # Logits for this minibatch
-
-        # Compute the loss value for this minibatch.
-        loss_value = loss(targets, logits)
-
-    # Use the gradient tape to automatically retrieve
-    # the gradients of the trainable variables with respect to the loss.
-    grads = tape.gradient(loss_value, model.trainable_weights)
-
-    for g,v in zip(grads, model.trainable_weights):
-        print(v.name)
-        print(g)
-        print('-----')
-    exit()
-    """
-
-
