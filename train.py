@@ -247,7 +247,7 @@ class Model(tf.keras.Model):
         gen_hot = tf.stop_gradient(gen_hot)
 
         # Denoise generated outputs to produce training targets
-        in0 = tf.where(gen_masked_hot == maskid_hot, gen_hot, gen_masked_hot)
+        in0 = tf.where(gen_masked_hot == maskid_hot, tf.stop_gradient(gen_prob), gen_masked_hot)
         regen_logits, _, _, gen_is_real, _ = self.denoiser((condition, in0, in0), training=False)
         gen_is_real = tf.stop_gradient(tf.nn.sigmoid(gen_is_real))  
         regen_prob = tf.nn.softmax(regen_logits)
@@ -263,7 +263,7 @@ class Model(tf.keras.Model):
         real_logits, fake_logits, _, is_real_logits, d_attn_weights = self.denoiser((condition, x, x))
         real_prob = tf.nn.softmax(real_logits)
         real_hot = tf.one_hot(tf.argmax(real_logits, axis=-1), depth=256)
-        re_real_logits, _, _, is_real_logits, d_attn_weights = self.denoiser((condition, real_hot, real_hot))
+        re_real_logits, _, _, is_real_logits, d_attn_weights = self.denoiser((condition, real_prob, real_prob))
 
         # Run the descriminator on mixed inputs to learn to distinguish between real/fake
         is_real_input_ids = tf.cast(tf.argmax(x, axis=-1), clean.dtype)
