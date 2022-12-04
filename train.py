@@ -179,12 +179,15 @@ class Model(tf.keras.Model):
 
             c = tf.keras.layers.Dropout(rate=dropout)(c)
             c = tf.keras.layers.Dense(d_model, None)(c)
-            q = tf.keras.layers.LayerNormalization(epsilon=1e-6)(c + attn_out)
-            kv = q
-            if i % 8 == 7:
-                kv = condition
+            layernorm = tf.keras.layers.LayerNormalization(epsilon=1e-6)
+            q = layernorm(c + attn_out)
+            kv = q # self attention
+            if i % 8 == 0:
                 outs.append(q)
-                q += latent_q
+            if i % 8 == 7:
+                kv = layernorm(condition) # FIXME use a new layernorm
+                outs[-1] += q
+#                q += latent_q
 
         descriminator_out = tf.keras.layers.Dense(1)(tf.reduce_sum(tf.stack(outs), axis=0))
         x = tf.concat(outs, axis=-1)
@@ -235,48 +238,60 @@ class Model(tf.keras.Model):
         seqlen = tf.shape(gen_masked)[1]
 
         # Run generator
-        _, _, gen_logits, _, attn_weights = self.generator((
+        _, _, gen_logits, gen_is_real, attn_weights = self.generator((
                                                     condition,
                                                     gen_masked_hot,
-                                                    gen_masked_hot))
+                                                    gen_masked_hot)) 
         gen_prob = tf.nn.softmax(gen_logits)
         gen_hot = tf.one_hot(tf.argmax(gen_logits, axis=-1), depth=256)
         gen_hot = tf.stop_gradient(gen_hot)
+        gen_is_real = tf.stop_gradient(tf.nn.sigmoid(gen_is_real))
 
         # Denoise generated outputs to produce training targets
         in0 = tf.where(gen_masked_hot == maskid_hot, tf.stop_gradient(gen_prob), gen_masked_hot)
-        regen_logits, _, _, gen_is_real, _ = self.denoiser((condition, in0, in0), training=False)
-        gen_is_real = tf.stop_gradient(tf.nn.sigmoid(gen_is_real))
+        regen_logits, _, _, regen_is_real, _ = self.denoiser((condition, in0, in0), training=False)
+        regen_is_real = tf.stop_gradient(tf.nn.sigmoid(regen_is_real))
         regen_prob = tf.nn.softmax(regen_logits)
         regen_hot = tf.one_hot(tf.argmax(regen_logits, axis=-1), depth=256)
 
-        # Mask real/gen inputs according to descrimnator scores
-        median = tf.sort(gen_is_real, axis=1)[:, seqlen//2]
-        x = tf.where(gen_is_real > median[:, :, tf.newaxis], gen_hot, hot_clean)
+        # Mask real+gen inputs according to descrimnator scores
+        percentile = tf.sort(gen_is_real, axis=1)[:, seqlen//4]
+        x = tf.where(gen_is_real > percentile[:, :, tf.newaxis], gen_hot, maskid_hot)
+        y = tf.where(gen_is_real > percentile[:, :, tf.newaxis], hot_clean, maskid_hot)
+        # Randomly swap generated vs real inputs
+        coin = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
+        x_ = tf.where(coin < 0.5, x, y)
+        y = tf.where(coin > 0.5, x, y)
+        x = x_
+
         # Run the denoiser to learn a language model
-        real_logits, _, _, is_real_logits, d_attn_weights = self.denoiser((condition, x, x))
+        is_fake_tolerance = 0.25
+        real_logits, _, _, is_real_logits, d_attn_weights = self.denoiser((condition, x, y))
         real_prob = tf.nn.softmax(real_logits)
         real_hot = tf.one_hot(tf.argmax(real_logits, axis=-1), depth=256)
         is_real_prob = tf.stop_gradient(tf.nn.sigmoid(is_real_logits))
-        # Rerun
+        is_fake_prob = tf.nn.relu((1 - is_real_prob) - is_fake_tolerance)
+        # Rerun denoiser
         re_real_logits, _, _, is_re_real_logits, d_attn_weights = self.denoiser((condition, real_prob, real_prob))
         is_re_real_prob = tf.stop_gradient(tf.nn.sigmoid(is_re_real_logits))
+        is_re_fake_prob = tf.nn.relu((1 - is_re_real_prob) - is_fake_tolerance)
 
         # Targets
-        is_real_input_ids = tf.cast(tf.argmax(x, axis=-1), clean.dtype)
-        is_real_targets = tf.where(is_real_input_ids == clean, 1, 0)
-        is_re_real_input_ids = tf.cast(tf.argmax(real_logits, axis=-1), clean.dtype)
-        is_re_real_targets = tf.where(is_re_real_input_ids == clean, 1, 0)
+        real_ids = tf.cast(tf.argmax(real_logits, axis=-1), clean.dtype)
+        is_real_targets = tf.where(real_ids == clean, 1, 0)
+        re_real_ids = tf.cast(tf.argmax(re_real_logits, axis=-1), clean.dtype)
+        is_re_real_targets = tf.where(re_real_ids == clean, 1, 0)
         # Losses
         gen_loss = self.xe_loss(tf.stop_gradient(regen_prob), gen_logits)
-        real_loss = self.xe_loss(hot_clean, real_logits, (1 - is_real_prob))
-        re_real_loss = self.xe_loss(hot_clean, re_real_logits, (1 - is_re_real_prob))
+        copy_loss = self.xe_loss(hot_clean, gen_logits, tf.where(gen_masked == 0, 0, 1))
+        real_loss = self.xe_loss(hot_clean, real_logits, is_fake_prob)
+        re_real_loss = self.xe_loss(hot_clean, re_real_logits, is_re_fake_prob)
         descrim_loss = self.sig_loss(is_real_targets, is_real_logits)
         descrim_loss += self.sig_loss(is_re_real_targets, is_re_real_logits)
 
         return ((real_loss,
                  re_real_loss,
-                 gen_loss,
+                 gen_loss + copy_loss,
                  descrim_loss
                 ),
                 {'denoiser_in':(x, x),
@@ -285,8 +300,8 @@ class Model(tf.keras.Model):
                  'regen_hot':regen_hot,
                  'regen_prob':regen_prob,
                  'real_prob':real_prob,
-                 'gen_hot':gen_hot,
                  'gen_is_real':gen_is_real,
+                 'regen_is_real':regen_is_real,
                  'attn_weights': attn_weights,
                  'd_attn_weights': d_attn_weights
                  })
@@ -337,17 +352,19 @@ def make_dataset(model, fpath, batchsize, seqlen, condlen, gramlen, shuffle, tra
     def gen():
         start = 0
         n = 0
+        mask = np.array([0, 0, 0, 0, 1] * (seqlen // 4))[:seqlen]
         for idx in range(num_examples):
             softmax_temp = max(1, 100 - (model.step / 1000))
 
             start = random.randint(condlen, num_bytes - (1 + seqlen))
             condition = text[start - condlen: start]
             center = text[start : start + seqlen]
-
-            mask_rate = 0.75
+            """
+            mask_rate = 0.6
             sample = np.random.uniform(size=(seqlen))
             gen_masked = np.where(sample < mask_rate, model.maskid, center)
-#            gen_masked = np.where(center != ord(b' '), model.maskid, center)
+            """
+            gen_masked = np.where(mask == 0, model.maskid, center)
             yield ((gen_masked, condition, center),
                     (center, center, center, center))
     dataset = tf.data.Dataset.from_generator(
@@ -373,6 +390,7 @@ def make_dataset(model, fpath, batchsize, seqlen, condlen, gramlen, shuffle, tra
 def plot(name, p, is_real=None):
     nticks = 256
     ticktext = [chr(i) for i in range(256)]
+    out_str = p_to_str(p)[0]
     if is_real is not None:
         nticks += 1
         p = np.concatenate([is_real, p], axis=-1)
@@ -382,7 +400,6 @@ def plot(name, p, is_real=None):
         tickvals = list(range(nticks)),
         ticktext = ticktext
     )
-    out_str = p_to_str(p)[0]
     yaxis = dict(
         tickmode = 'array',
         tickvals = list(range(len(out_str))),
@@ -400,11 +417,11 @@ def char_predict(model, dataset, num):
     out = model.forward_pass(inputs, training=False)
 
     generated = out[1]['generated']
-    gen_hot = out[1]['gen_hot']
     real_prob = out[1]['real_prob']
     gen_logits = out[1]['gen_logits']
     gen_is_real = out[1]['gen_is_real']
-    print('\ngen_is_real: ', np.mean(np.mean(gen_is_real, axis=1)))
+    regen_is_real = out[1]['regen_is_real']
+    is_real_idx = np.argsort(np.mean(gen_is_real[:, :, 0], axis=1))
     regen_prob = out[1]['regen_prob']
     denoiser_x, denoiser_y = out[1]['denoiser_in']
     attn_weights = out[1]['attn_weights']
@@ -421,17 +438,18 @@ def char_predict(model, dataset, num):
         fig.write_html(f'x_d_attn_{idx}.html')
 
     plot('x_gen_prob_best', generated[0:1], gen_is_real[0:1])
-    plot('x_regen_prob_best', regen_prob[0:1])
+    plot('x_regen_prob_best', regen_prob[0:1], regen_is_real[0:1])
     plot('x_real_prob_best', real_prob[0:1])
 
     masked_str = to_str(inputs[0])
-    regen_hot = p_to_str(regen_prob)
+    regen_str = p_to_str(regen_prob)
     generated = p_to_str(generated)
     denoiser_x = p_to_str(denoiser_x)
     real_str = p_to_str(real_prob)
     print('--\n')
-    for i in range(num):
-        print(cnd_str[i] + '|' + regen_hot[i])
+    indexes = [is_real_idx[0],is_real_idx[127], is_real_idx[128],  is_real_idx[-1]]
+    for i in indexes:
+        print(cnd_str[i] + '|' + regen_str[i])
         print('--')
         print(cnd_str[i] + '|' + generated[i])
         print('--')
