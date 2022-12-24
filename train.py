@@ -250,27 +250,27 @@ class Model(tf.keras.Model):
 
 
         # Run generator
-        gen_cls, _, _, gen_logits, gen_is_real, attn_weights = self.generator((
+
+        noise = tf.random.normal([batchsize, seqlen, 256], 0, 0.1)
+        gen_cls, _, _, gen_logits, gen_is_real_logits, attn_weights = self.generator((
                                                     condition,
-                                                    gen_masked_hot,
-                                                    gen_masked_hot))
+                                                    noise+gen_masked_hot,
+                                                    noise+gen_masked_hot))
         gen_prob = tf.nn.softmax(gen_logits)
         gen_hot = tf.one_hot(tf.argmax(gen_logits, axis=-1), depth=256)
         gen_hot = tf.stop_gradient(gen_hot)
-        gen_is_real = tf.stop_gradient(tf.nn.sigmoid(gen_is_real))
+        gen_is_real = tf.stop_gradient(tf.nn.sigmoid(gen_is_real_logits))
 
-        # Pass generated outputs through the model to produce training targets
-        in0 = tf.stop_gradient(gen_prob)
-        regen_cls, regen_x, regen_logits, _, regen_is_real, _ = self.denoiser((condition, in0, in0), training=False)
-        regen_is_real = tf.stop_gradient(tf.nn.sigmoid(regen_is_real))
-        regen_prob = tf.nn.softmax(regen_logits)
-        regen_is_fake_prob = (1 - regen_is_real)
 
+       ######
        # Mask real+gen inputs according to descrimnator scores
-#        sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
-#        x = tf.where(0.5 < sample, gen_hot, hot_clean)
-        median = tf.sort(gen_is_real, axis=1)[:, seqlen//2, tf.newaxis]
-        x = tf.where(gen_is_real > median, gen_hot, hot_clean)
+#        median = tf.sort(gen_is_real, axis=1)[:, seqlen//2, tf.newaxis]
+#        x = tf.where(gen_is_real > median, gen_hot, hot_clean)
+#        y = tf.where(gen_is_real < median, gen_hot, hot_clean)
+#        coin = tf.random.uniform([batchsize, 1, 1], 0, 1)
+#        x = tf.where(coin < 0.5, x, y)
+        sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
+        x = tf.where(sample < 0.5, gen_hot, hot_clean)
 
         # Run the denoiser to learn a language model
         _, denoise_x, denoise_logits, _, denoise_is_real_logits, d_attn_weights = self.denoiser(
@@ -280,6 +280,20 @@ class Model(tf.keras.Model):
         denoise_is_real_prob = tf.nn.sigmoid(denoise_is_real_logits)
         denoise_is_fake_prob = (1 - denoise_is_real_prob)
 
+
+        #######
+        # Pass generated outputs through the model to produce training targets
+        regen_in = tf.stop_gradient(gen_prob + gen_is_real*denoise_prob) 
+        regen_cls, regen_x, regen_logits, _, regen_is_real, _ = self.denoiser(
+            (condition, regen_in, regen_in),
+            training=False
+        )
+        regen_is_real = tf.stop_gradient(tf.nn.sigmoid(regen_is_real))
+        regen_prob = tf.nn.softmax(regen_logits)
+        regen_is_fake_prob = (1 - regen_is_real)
+
+
+        ################
         # Rerun denoiser
         in0 = denoise_prob
         _, redenoise_x, redenoise_logits, _, redenoise_is_real_logits, d_attn_weights = self.denoiser(
@@ -290,7 +304,6 @@ class Model(tf.keras.Model):
         redenoise_is_fake_prob = (1 - redenoise_is_real_prob)
 
         # Losses
-        no_train_regen_is_fake_prob = tf.stop_gradient(regen_is_fake_prob)
         no_train_denoise_is_fake_prob = tf.stop_gradient(denoise_is_fake_prob)
         no_train_redenoise_is_fake_prob = tf.stop_gradient(redenoise_is_fake_prob)
         """
@@ -306,9 +319,6 @@ class Model(tf.keras.Model):
         """
         gen_loss = self.xe_loss(tf.stop_gradient(regen_prob), gen_logits)
         copy_loss = self.xe_loss(gen_masked_hot, gen_logits, tf.where(gen_masked==0, 0, 1))
-        regen_sample_weights = tf.nn.sigmoid((no_train_regen_is_fake_prob - 0.5)/0.05)
-        regen_loss = self.xe_loss(hot_clean, regen_logits,
-                regen_sample_weights)
         denoise_sample_weights = tf.nn.sigmoid((no_train_denoise_is_fake_prob - 0.5)/0.05)
         denoise_loss = self.xe_loss(hot_clean, denoise_logits,
                 denoise_sample_weights)
@@ -319,11 +329,11 @@ class Model(tf.keras.Model):
         # Descriminator losses
         denoise_is_real_targets = self.correct(denoise_logits, hot_clean)
         redenoise_is_real_targets = self.correct(redenoise_logits, hot_clean)
-        descrim_loss = self.sig_loss(denoise_is_real_targets, denoise_is_real_logits)*0.5
-        descrim_loss += self.sig_loss(redenoise_is_real_targets, redenoise_is_real_logits)*0.5
-
-        """
-        # Look ahead loss
+#        gen_is_real_targets = self.correct(denoise_prob, gen_hot)
+        descrim_loss = self.sig_loss(denoise_is_real_targets, denoise_is_real_logits)*(1/2)
+        descrim_loss += self.sig_loss(redenoise_is_real_targets, redenoise_is_real_logits)*(1/2)
+#        descrim_loss += self.sig_loss(gen_is_real_targets, gen_is_real_logits)*(1/3)
+        
         gen_cls = tf.reshape(gen_cls, [batchsize//2, 2, self.d_model])
         true_continuation = tf.concat([gen_cls[:, 0], gen_cls[:, 1]], axis=-1)
         false_continuation = tf.concat([gen_cls[:, 1], gen_cls[:, 0]], axis=-1)
@@ -332,24 +342,31 @@ class Model(tf.keras.Model):
             gen_is_continued = layer(gen_is_continued)
         gen_is_continued_tgt = tf.concat([tf.ones((batchsize//2)), tf.zeros(batchsize//2)], axis=0)
         gen_cls_loss = self.sig_loss(gen_is_continued_tgt, gen_is_continued)
-        """
+
         """
         diversity_loss = 0
         clean_sum = tf.reduce_sum(hot_clean, axis=1)
         gen_sum = tf.reduce_sum(gen_prob, axis=1)
         regen_sum = tf.reduce_sum(regen_prob, axis=1)
-        for shift in range(1, 101):
+        for shift in range(1, 2):
             clean_similarity = self.cosine_loss(clean_sum, tf.roll(clean_sum, shift=shift, axis=0))
             clean_similarity = 1 - ((1 + clean_similarity) / 2)
 
             loss = -self.cosine_loss(regen_sum, tf.roll(regen_sum, shift=shift, axis=0))
             diversity_loss += tf.nn.relu((loss - clean_similarity))
-
-
-
-        realism_loss = self.cosine_loss(tf.stop_gradient(clean_sum), gen_sum)
         """
 
+        diversity_loss = 0
+        for shift in range(1, 2):
+            targets = tf.stop_gradient(tf.roll(gen_prob, shift=shift, axis=0))
+            sample_weights = tf.stop_gradient(1 - gen_is_real)
+            diversity_loss -= self.cosine_loss(targets, gen_prob, sample_weights)
+            shift = tf.random.uniform((), 1, 3, tf.int32)
+#            targets = tf.stop_gradient(tf.roll(gen_prob, shift=1, axis=1))
+#            diversity_loss -= self.cosine_loss(targets, gen_prob, sample_weights)
+#        realism_loss = self.cosine_loss(tf.stop_gradient(clean_sum), gen_sum)
+
+        """
         gen_sum = tf.reduce_sum(gen_prob, axis=1)
         condition_sum = tf.reduce_sum(condition, axis=1)
         match = tf.concat([gen_sum, condition_sum], axis=-1)
@@ -361,18 +378,18 @@ class Model(tf.keras.Model):
         is_match_tgt = tf.concat([tf.ones_like(match), tf.zeros_like(nomatch)], axis=0)
         is_match = tf.concat([match, nomatch], axis=0)
         is_match_loss = self.sig_loss(is_match_tgt, is_match)
-
+        """
         return ((gen_loss+copy_loss,
                  denoise_loss,
                  redenoise_loss,
                  descrim_loss,
-                 is_match_loss,
-#                 0.01*diversity_loss,
-#                 realism_loss
+                 gen_cls_loss,
+                 1*diversity_loss,
                 ),
                 {'denoiser_in':(x, x),
                  'gen_logits': gen_logits,
                  'generated':gen_prob,
+                 'regen_in':regen_in,
                  'regen_prob':regen_prob,
                  'denoise_prob':denoise_prob,
                  'gen_is_real':gen_is_real,
@@ -428,7 +445,7 @@ def make_dataset(model, fpath, batchsize, seqlen, condlen, gramlen, shuffle, tra
     def gen():
         start = 0
         n = 0
-        mask = np.array(31*[0] + [0])[:seqlen]
+        mask = np.array(4*[0, 0, 0, 0, 0, 0, 0, 0, 1])[:seqlen]
         for idx in range(num_examples):
             softmax_temp = max(1, 100 - (model.step / 1000))
             if idx % 2 == 0:
@@ -446,16 +463,16 @@ def make_dataset(model, fpath, batchsize, seqlen, condlen, gramlen, shuffle, tra
 #            print(idx%2, to_str([condition])[0], '|', to_str([center])[0])
 #            print('\n\n===============\n=============\n\n')
 
-            alt_start = random.randint(condlen, num_bytes - (1 + seqlen))
+            alt_start = start#random.randint(condlen, num_bytes - (1 + seqlen))
             alt_center = text[alt_start : alt_start + seqlen]
             gen_masked = alt_center*mask
 
-            mask_rate = 0.25
-            sample = np.random.uniform(size=(condlen))
-            condition = np.where(sample < mask_rate, model.maskid, condition)
+#            mask_rate = 0.25
+#            sample = np.random.uniform(size=(condlen))
+#            condition = np.where(sample < mask_rate, model.maskid, condition)
 
             yield ((gen_masked, condition, center),
-                    (center, 1,1,1,1))
+                    (center, 1,1,1,1,1))
     dataset = tf.data.Dataset.from_generator(
             gen,
             output_signature = (
@@ -466,6 +483,7 @@ def make_dataset(model, fpath, batchsize, seqlen, condlen, gramlen, shuffle, tra
                 ),
                 (
                     tf.TensorSpec(shape=(seqlen), dtype=tf.int32),
+                    tf.TensorSpec(shape=(), dtype=tf.int32),
                     tf.TensorSpec(shape=(), dtype=tf.int32),
                     tf.TensorSpec(shape=(), dtype=tf.int32),
                     tf.TensorSpec(shape=(), dtype=tf.int32),
@@ -532,6 +550,7 @@ def char_predict(model, dataset, num):
     regen_is_real = out[1]['regen_is_real']
     gen_is_real_idx = np.argsort(np.mean(gen_is_real[:, :, 0], axis=1))
     regen_prob = out[1]['regen_prob']
+    regen_in = out[1]['regen_in']
     denoiser_x, denoiser_y = out[1]['denoiser_in']
     attn_weights = out[1]['attn_weights']
     # Plots
@@ -543,6 +562,7 @@ def char_predict(model, dataset, num):
     # Print outs
     masked_str = to_str(inputs[0])
     regen_str = p_to_str(regen_prob)
+    regen_in_str = p_to_str(regen_in)
     generated = p_to_str(generated)
     denoiser_x = p_to_str(denoiser_x)
     denoise_str = p_to_str(denoise_prob)
@@ -554,7 +574,7 @@ def char_predict(model, dataset, num):
         print('-----------------------------')
         print(cnd_str[i] + '|' + generated[i])
         print('-----------------------------')
-        print(cnd_str[i] + '|' + masked_str[i])
+        print(cnd_str[i] + '|' + regen_in_str[i])
         print('-----------------------------')
         print(cnd_str[i] + '|' + target_str[i])
         print('-----------------------------')
@@ -581,15 +601,15 @@ if __name__ == '__main__':
     d_model = 256
     enc_depth = 8
     dropout = 0.01
-    batchsize = 128
+    batchsize = 120
     condlen = 64
     seqlen = 32
     gramlen = 5
 
     model = Model(d_model, seqlen, enc_depth, dropout)
 
-    dataset = make_dataset(model, './guten-wot-train.txt', batchsize, seqlen, condlen, gramlen, shuffle=True, training=True)
-    valid_dataset = make_dataset(model, './guten-test.txt', batchsize, seqlen, condlen, gramlen, shuffle=True, training=False)
+    dataset = make_dataset(model, './train.txt', batchsize, seqlen, condlen, gramlen, shuffle=True, training=True)
+    valid_dataset = make_dataset(model, './valid.txt', batchsize, seqlen, condlen, gramlen, shuffle=True, training=False)
 
     inputs, targets = next(iter(dataset))
     condition_strings = to_str(inputs[1])
