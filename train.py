@@ -250,7 +250,6 @@ class Model(tf.keras.Model):
 
 
         # Run generator
-
         noise = tf.random.normal([batchsize, seqlen, 256], 0, 0.1)
         gen_cls, _, _, gen_logits, gen_is_real_logits, attn_weights = self.generator((
                                                     condition,
@@ -263,12 +262,8 @@ class Model(tf.keras.Model):
 
 
        ######
-       # Mask real+gen inputs according to descrimnator scores
+       # Mix real + generated inputs
 #        median = tf.sort(gen_is_real, axis=1)[:, seqlen//2, tf.newaxis]
-#        x = tf.where(gen_is_real > median, gen_hot, hot_clean)
-#        y = tf.where(gen_is_real < median, gen_hot, hot_clean)
-#        coin = tf.random.uniform([batchsize, 1, 1], 0, 1)
-#        x = tf.where(coin < 0.5, x, y)
         sample = tf.random.uniform([batchsize, seqlen, 1], 0, 1)
         x = tf.where(sample < 0.5, gen_hot, hot_clean)
 
@@ -282,7 +277,7 @@ class Model(tf.keras.Model):
 
 
         #######
-        # Pass generated outputs through the model to produce training targets
+        # Pass generated outputs through the denoiser to produce training targets
         regen_in = tf.stop_gradient(gen_prob + gen_is_real*denoise_prob) 
         regen_cls, regen_x, regen_logits, _, regen_is_real, _ = self.denoiser(
             (condition, regen_in, regen_in),
@@ -303,20 +298,12 @@ class Model(tf.keras.Model):
         redenoise_is_real_prob = tf.nn.sigmoid(redenoise_is_real_logits)
         redenoise_is_fake_prob = (1 - redenoise_is_real_prob)
 
+  
+        ################
         # Losses
         no_train_denoise_is_fake_prob = tf.stop_gradient(denoise_is_fake_prob)
         no_train_redenoise_is_fake_prob = tf.stop_gradient(redenoise_is_fake_prob)
-        """
-        kernel = self.descriminator_layer.kernel.value()
-        bias = self.descriminator_layer.bias.value()
-        logits = tf.matmul(a=denoise_x, b=kernel)
-        logits = tf.nn.bias_add(logits, bias)
-        no_train_denoise_is_fake_prob = (1 - tf.nn.sigmoid(logits))
 
-        logits = tf.matmul(a=redenoise_x, b=kernel)
-        logits = tf.nn.bias_add(logits, bias)
-        no_train_redenoise_is_fake_prob = (1 - tf.nn.sigmoid(logits))
-        """
         gen_loss = self.xe_loss(tf.stop_gradient(regen_prob), gen_logits)
         copy_loss = self.xe_loss(gen_masked_hot, gen_logits, tf.where(gen_masked==0, 0, 1))
         denoise_sample_weights = tf.nn.sigmoid((no_train_denoise_is_fake_prob - 0.5)/0.05)
@@ -329,11 +316,10 @@ class Model(tf.keras.Model):
         # Descriminator losses
         denoise_is_real_targets = self.correct(denoise_logits, hot_clean)
         redenoise_is_real_targets = self.correct(redenoise_logits, hot_clean)
-#        gen_is_real_targets = self.correct(denoise_prob, gen_hot)
         descrim_loss = self.sig_loss(denoise_is_real_targets, denoise_is_real_logits)*(1/2)
         descrim_loss += self.sig_loss(redenoise_is_real_targets, redenoise_is_real_logits)*(1/2)
-#        descrim_loss += self.sig_loss(gen_is_real_targets, gen_is_real_logits)*(1/3)
-        
+   
+        # Class loss tries to learn sequence order of adjacent batch elements     
         gen_cls = tf.reshape(gen_cls, [batchsize//2, 2, self.d_model])
         true_continuation = tf.concat([gen_cls[:, 0], gen_cls[:, 1]], axis=-1)
         false_continuation = tf.concat([gen_cls[:, 1], gen_cls[:, 0]], axis=-1)
@@ -343,42 +329,15 @@ class Model(tf.keras.Model):
         gen_is_continued_tgt = tf.concat([tf.ones((batchsize//2)), tf.zeros(batchsize//2)], axis=0)
         gen_cls_loss = self.sig_loss(gen_is_continued_tgt, gen_is_continued)
 
-        """
-        diversity_loss = 0
-        clean_sum = tf.reduce_sum(hot_clean, axis=1)
-        gen_sum = tf.reduce_sum(gen_prob, axis=1)
-        regen_sum = tf.reduce_sum(regen_prob, axis=1)
-        for shift in range(1, 2):
-            clean_similarity = self.cosine_loss(clean_sum, tf.roll(clean_sum, shift=shift, axis=0))
-            clean_similarity = 1 - ((1 + clean_similarity) / 2)
-
-            loss = -self.cosine_loss(regen_sum, tf.roll(regen_sum, shift=shift, axis=0))
-            diversity_loss += tf.nn.relu((loss - clean_similarity))
-        """
-
+        # Prevent generator from collapsing to the same output 
         diversity_loss = 0
         for shift in range(1, 2):
             targets = tf.stop_gradient(tf.roll(gen_prob, shift=shift, axis=0))
             sample_weights = tf.stop_gradient(1 - gen_is_real)
             diversity_loss -= self.cosine_loss(targets, gen_prob, sample_weights)
             shift = tf.random.uniform((), 1, 3, tf.int32)
-#            targets = tf.stop_gradient(tf.roll(gen_prob, shift=1, axis=1))
-#            diversity_loss -= self.cosine_loss(targets, gen_prob, sample_weights)
 #        realism_loss = self.cosine_loss(tf.stop_gradient(clean_sum), gen_sum)
 
-        """
-        gen_sum = tf.reduce_sum(gen_prob, axis=1)
-        condition_sum = tf.reduce_sum(condition, axis=1)
-        match = tf.concat([gen_sum, condition_sum], axis=-1)
-        nomatch = tf.concat([gen_sum, tf.roll(condition_sum, shift=1, axis=0)], axis=-1)
-        for layer in self.class_layers:
-            match = layer(match)
-        for layer in self.class_layers:
-            nomatch = layer(nomatch)
-        is_match_tgt = tf.concat([tf.ones_like(match), tf.zeros_like(nomatch)], axis=0)
-        is_match = tf.concat([match, nomatch], axis=0)
-        is_match_loss = self.sig_loss(is_match_tgt, is_match)
-        """
         return ((gen_loss+copy_loss,
                  denoise_loss,
                  redenoise_loss,
@@ -466,10 +425,6 @@ def make_dataset(model, fpath, batchsize, seqlen, condlen, gramlen, shuffle, tra
             alt_start = start#random.randint(condlen, num_bytes - (1 + seqlen))
             alt_center = text[alt_start : alt_start + seqlen]
             gen_masked = alt_center*mask
-
-#            mask_rate = 0.25
-#            sample = np.random.uniform(size=(condlen))
-#            condition = np.where(sample < mask_rate, model.maskid, condition)
 
             yield ((gen_masked, condition, center),
                     (center, 1,1,1,1,1))
